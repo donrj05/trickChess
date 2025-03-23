@@ -1,3 +1,12 @@
+#inverted the sign at count_non_losing moves
+#added trick move display
+
+#Potential futureworks:
+#Move selections by opp
+#Trick moves definition
+#eval from any position
+
+
 #pgn for my own analysis on lichess
 from datetime import date
 import chess
@@ -10,7 +19,7 @@ import io
 STOCKFISH_PATH = "/opt/homebrew/bin/stockfish"
 engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
 
-def count_non_losing_moves(board):
+def isTricky(board):
     """
     Counts the number of opponent moves that do NOT result in a significant disadvantage.
     A move is considered 'non-losing' if its evaluation is above -200 cp
@@ -22,21 +31,26 @@ def count_non_losing_moves(board):
         board.push(move)
         info = engine.analyse(board, chess.engine.Limit(depth=10))
         eval_score = info["score"].relative.score() if info["score"].relative.score() is not None else 0
-        move_evaluations[move] = eval_score
+        move_evaluations[move] = -eval_score
         board.pop()
 
     if not move_evaluations:
-        return 0
+        return False,0
 
     best_move = max(move_evaluations, key=move_evaluations.get, default=None)
     if best_move is None:
-        return 0
+        return False,0
 
     best_score = move_evaluations[best_move]
     if all(score < -200 for score in move_evaluations.values()):
-        return 0
-
-    return sum(1 for score in move_evaluations.values() if score > -200)
+        return False,0
+    if(len(move_evaluations)<2):
+        return False,0
+    second_highest = sorted(set(move_evaluations.values()), reverse=True)[1]
+    if sum(1 for score in move_evaluations.values() if score+200>=best_score) == 1:
+        return True, second_highest
+    else:
+        return False, 0
 
 def compute_reward(board, move):
     """
@@ -44,7 +58,7 @@ def compute_reward(board, move):
     where they have only one non-losing move.
     """
     board.push(move)
-    non_losing_moves = count_non_losing_moves(board)
+    duo = isTricky(board)
     info = engine.analyse(board, chess.engine.Limit(depth=10))
     score = info["score"].relative
 
@@ -53,13 +67,13 @@ def compute_reward(board, move):
     else:
         stockfish_eval = score.score()
 
-    trick_bonus = 1.0 if stockfish_eval < 400 and non_losing_moves == 1 else 0.0
+    trick_bonus = -duo[1] if stockfish_eval < 400 and duo[0] else 0.0
 
     #inverting since stockfish_eval is analysing from black's perspective
     base_reward = -stockfish_eval / 100.0
 
     board.pop()
-    return base_reward+trick_bonus
+    return base_reward,trick_bonus
 
 def select_move(board, engine):
     """
@@ -104,13 +118,18 @@ def train_trick_stockfish(num_games=5):
 
             move_rewards = {move: compute_reward(board, move) for move in legal_moves}
             #print(move_rewards)
-            best_trick_move = max((m for m in move_rewards if move_rewards[m] > 0.5),
-                                  key=lambda m: move_rewards[m], default=None)
+            best_trick_move = max((m for m in move_rewards if move_rewards[m][0] >-100),
+                                  key=lambda m: move_rewards[m][0]+move_rewards[m][1], default=None)
+            result = engine.play(board, chess.engine.Limit(depth=10))
+            best_move = result.move
             #print(best_trick_move)
             if best_trick_move:
                 board.push(best_trick_move)
+                if(move_rewards[best_trick_move][1] > 0):
+                    print(f"{best_trick_move} is a trick move! otherwise I was choosing {best_move} at move number {count+1}")  
+                    #print(move_rewards)
             else:
-                result = engine.play(board, chess.engine.Limit(depth=10))
+                #result = engine.play(board, chess.engine.Limit(depth=10))
                 if result.move:
                     board.push(result.move)
                 else:
