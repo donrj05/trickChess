@@ -5,7 +5,9 @@
 #Move selections by opp
 #Trick moves definition
 #eval from any position
-
+#WHITE SIDE WORK IN PROGRESS
+#Dont compare with best move, rather use the current evaluation
+#can I use stockfish tree without recalculating for each move?
 
 #pgn for my own analysis on lichess
 from datetime import date
@@ -17,60 +19,116 @@ import io
 # Using stockfish on my system, you are free to choose Lc0 if you want gpu acceleration
 # Path to Stockfish (installed via Homebrew)
 STOCKFISH_PATH = "/opt/homebrew/bin/stockfish"
+#STOCKFISH_PATH = "./stockfish"
 engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
 
-def isTricky(board):
-    """
-    Counts the number of opponent moves that do NOT result in a significant disadvantage.
-    A move is considered 'non-losing' if its evaluation is above -200 cp
-    """
-    legal_moves = list(board.legal_moves)
-    move_evaluations = {}
+FORKING_PIECES = {chess.KNIGHT, chess.PAWN, chess.BISHOP}
 
+def enemies_attacked_by_piece_on(board, sq):
+    piece = board.piece_at(sq)
+    if piece is None:
+        return set()
+    enemy = not piece.color
+    attacks = board.attacks(sq)
+    return {
+        s for s in chess.SQUARES
+        if (p := board.piece_at(s)) and p.color == enemy and s in attacks
+    }
+
+def is_obvious_fork(board, move):
+    piece = board.piece_at(move.from_square)
+    if piece is None or piece.piece_type not in FORKING_PIECES:
+        return False
+
+    before = enemies_attacked_by_piece_on(board, move.from_square)
+    board.push(move)
+    after = enemies_attacked_by_piece_on(board, move.to_square)
+    board.pop()
+
+    new_targets = after - before
+    if len(new_targets) != 2:
+        return False
+
+    return any(board.piece_at(sq).piece_type == chess.KING for sq in new_targets)
+
+def obvious_moves(board, move):
+    """
+    Obvious replies that shouldn't count as a tricky defense:
+    1. Any capture (including recaptures and en passant)
+    2. Royal fork — new double attack on king + one other piece by knight/pawn/bishop
+    """
+    if board.is_capture(move):
+        return True
+
+    #if is_obvious_fork(board, move):
+       # return True
+
+    return False
+def isTricky(board,prev_score): 
+    """
+    Counts the number of opponent moves(BLACK's) that do NOT result in a significant disadvantage.
+    A move is considered 'non-losing' if its evaluation is within 200 cp of the best reply.
+    """
+    if len(board.piece_map()) < 15:
+        return False, 0
+    legal_moves = list(board.legal_moves)
+    if len(legal_moves) < 5:
+        return False, 0
+
+    move_evaluations = {}
     for move in legal_moves:
         board.push(move)
         info = engine.analyse(board, chess.engine.Limit(depth=10))
-        eval_score = info["score"].relative.score() if info["score"].relative.score() is not None else 0
-        move_evaluations[move] = -eval_score
+        eval_score = info["score"].white().score() if info["score"].white().score() is not None else 0
+        move_evaluations[move] = eval_score
         board.pop()
 
     if not move_evaluations:
-        return False,0
+        return False, 0
 
-    best_move = max(move_evaluations, key=move_evaluations.get, default=None)
+    best_move = min(move_evaluations, key=move_evaluations.get, default=None)
     if best_move is None:
-        return False,0
+        return False, 0
 
     best_score = move_evaluations[best_move]
-    if all(score < -200 for score in move_evaluations.values()):
-        return False,0
-    if(len(move_evaluations)<2):
-        return False,0
-    second_highest = sorted(set(move_evaluations.values()), reverse=True)[1]
-    if sum(1 for score in move_evaluations.values() if score+200>=best_score) == 1:
-        return True, second_highest
-    else:
+    if all(score > 200 for score in move_evaluations.values()):
         return False, 0
+
+    # Second-best tier: strictly worse than best, ties at best excluded
+    worse_scores = [s for s in move_evaluations.values() if s > best_score]
+    if not worse_scores:
+        return False, 0
+    second_highest = min(worse_scores)
+
+    within_band = sum(1 for score in move_evaluations.values() if score <= best_score + 200)
+    if within_band == 1 and second_highest > prev_score + 50:
+        if obvious_moves(board, best_move):
+            return False, 0
+        return True, second_highest - prev_score
+    return False, 0
 
 def compute_reward(board, move):
     """
     Reward function that encourages forcing the opponent into a tricky position
     where they have only one non-losing move.
     """
-    board.push(move)
-    duo = isTricky(board)
     info = engine.analyse(board, chess.engine.Limit(depth=10))
-    score = info["score"].relative
+    eval_score = info["score"].white().score() 
+    if eval_score is None:
+        eval_score = 0
+    board.push(move)
+    duo = isTricky(board,eval_score)
+    info = engine.analyse(board, chess.engine.Limit(depth=10))
+    score = info["score"].white()
 
     if score.is_mate():
         stockfish_eval = 10000 if score.mate() > 0 else -10000
     else:
         stockfish_eval = score.score()
 
-    trick_bonus = -duo[1] if stockfish_eval < 400 and duo[0] else 0.0
+    trick_bonus = 5*duo[1] if -150 < stockfish_eval < 200 and duo[0] else 0.0
 
-    #inverting since stockfish_eval is analysing from black's perspective
-    base_reward = -stockfish_eval / 100.0
+    base_reward = stockfish_eval / 100.0
 
     board.pop()
     return base_reward,trick_bonus
@@ -82,7 +140,7 @@ def select_move(board, engine):
     This function is open to more research and is trainable on its own too.
     Maybe future implementation if I am unemployed.
     """
-    info = engine.analyse(board, chess.engine.Limit(depth=5), multipv=5)
+    info = engine.analyse(board, chess.engine.Limit(depth=10), multipv=5)
     legal_moves = list(board.legal_moves)
     moves = [entry['pv'][0] for entry in info if 'pv' in entry]
     if len(legal_moves)<1:
@@ -91,7 +149,7 @@ def select_move(board, engine):
     #     return random.choice(legal_moves)
     return moves[0] #if random.random() < 0.4 else moves[0]
 
-def train_trick_stockfish(num_games=5):
+def train_trick_stockfish(num_games=1):
     count = 0
     """
     Main function
@@ -118,6 +176,9 @@ def train_trick_stockfish(num_games=5):
 
             move_rewards = {move: compute_reward(board, move) for move in legal_moves}
             #print(move_rewards)
+            #define [m][0] and [m][1]
+            # it is a normal gain and trick gain respectively
+
             best_trick_move = max((m for m in move_rewards if move_rewards[m][0] >-100),
                                   key=lambda m: move_rewards[m][0]+move_rewards[m][1], default=None)
             result = engine.play(board, chess.engine.Limit(depth=10))
@@ -134,7 +195,7 @@ def train_trick_stockfish(num_games=5):
                     board.push(result.move)
                 else:
                     break
-
+            
             node = node.add_variation(board.peek())  # Add move to PGN
 
             selected_move = select_move(board, engine)
